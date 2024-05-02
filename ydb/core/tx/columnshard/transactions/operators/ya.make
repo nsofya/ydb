@@ -7,6 +7,8 @@ SRCS(
     GLOBAL backup.cpp
 )
 
+YQL_LAST_ABI_VERSION()
+
 PEERDIR(
     ydb/core/tx/columnshard/transactions
     ydb/core/tx/columnshard/data_sharing/destination/events

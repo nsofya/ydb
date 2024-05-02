@@ -232,9 +232,9 @@ void TColumnShard::Handle(TEvColumnShard::TEvWrite::TPtr& ev, const TActorContex
     }
 }
 
-class TCommitOperation {
+class TEvWriteLocksOp {
 public:
-    using TPtr = std::shared_ptr<TCommitOperation>;
+    using TPtr = std::shared_ptr<TEvWriteLocksOp>;
 
     bool Parse(const NEvents::TDataEvents::TEvWrite& evWrite) {
         if (evWrite.Record.GetLocks().GetLocks().size() != 1) {
@@ -243,17 +243,19 @@ public:
         LockId = evWrite.Record.GetLocks().GetLocks()[0].GetLockId();
         TxId = evWrite.Record.GetTxId();
         KqpLocks = evWrite.Record.GetLocks();
-        return !!LockId && !!TxId && KqpLocks.GetOp() == NKikimrDataEvents::TKqpLocks::Commit;
+        LocksOp = KqpLocks.GetOp();
+        return !!LockId && !!TxId && KqpLocks.GetOp() != NKikimrDataEvents::TKqpLocks::Unspecified;
     }
 
 private:
-    NKikimrDataEvents::TKqpLocks KqpLocks;
+    YDB_READONLY_DEF(NKikimrDataEvents::TKqpLocks, KqpLocks);
     YDB_READONLY(ui64, LockId, 0);
     YDB_READONLY(ui64, TxId, 0);
+    YDB_READONLY(NKikimrDataEvents::TKqpLocks::ELocksOp, LocksOp, NKikimrDataEvents::TKqpLocks::Unspecified);
 };
 class TProposeWriteTransaction : public TProposeTransactionBase {
 public:
-    TProposeWriteTransaction(TColumnShard* self, TCommitOperation::TPtr op, const TActorId source, const ui64 cookie)
+    TProposeWriteTransaction(TColumnShard* self, TEvWriteLocksOp::TPtr op, const TActorId source, const ui64 cookie)
         : TProposeTransactionBase(self)
         , WriteCommit(op)
         , Source(source)
@@ -269,15 +271,20 @@ private:
     void OnProposeError(TTxController::TProposeResult& proposeResult, const TTxController::TBasicTxInfo& txInfo) override;
 
 private:
-    TCommitOperation::TPtr WriteCommit;
+    TEvWriteLocksOp::TPtr WriteCommit;
     TActorId Source;
     ui64 Cookie;
     std::unique_ptr<NActors::IEventBase> Result;
 };
 
 bool TProposeWriteTransaction::Execute(TTransactionContext& txc, const TActorContext&) {
+    if (WriteCommit->GetLocksOp() == NKikimrDataEvents::TKqpLocks::Rollback) {
+        // Do nothing because we not sarted distributed transaction yet
+        return true;
+    }
     NKikimrTxColumnShard::TCommitWriteTxBody proto;
     proto.SetLockId(WriteCommit->GetLockId());
+    *proto.MutableKqpLocks() = WriteCommit->GetKqpLocks();
     TString txBody;
     Y_ABORT_UNLESS(proto.SerializeToString(&txBody));
     ProposeTransaction(TTxController::TBasicTxInfo(NKikimrTxColumnShard::TX_KIND_COMMIT_WRITE, WriteCommit->GetTxId()), txBody, Source, Cookie, txc);
@@ -314,7 +321,7 @@ void TColumnShard::Handle(NEvents::TDataEvents::TEvWrite::TPtr& ev, const TActor
     }
 
     if (behaviour == EOperationBehaviour::CommitWriteLock) {
-        auto commitOperation = std::make_shared<TCommitOperation>();
+        auto commitOperation = std::make_shared<TEvWriteLocksOp>();
         if (!commitOperation->Parse(*ev->Get())) {
             IncCounter(COUNTER_WRITE_FAIL);
             auto result = NEvents::TDataEvents::TEvWriteResult::BuildError(TabletID(), 0, NKikimrDataEvents::TEvWriteResult::STATUS_BAD_REQUEST, "invalid commit event");
@@ -324,7 +331,7 @@ void TColumnShard::Handle(NEvents::TDataEvents::TEvWrite::TPtr& ev, const TActor
         return;
     }
 
-    const ui64 lockId = (behaviour == EOperationBehaviour::InTxWrite) ? record.GetTxId() : record.GetLockTxId();
+    const ui64 lockId = (behaviour == EOperationBehaviour::WriteWithCoordinator) ? record.GetTxId() : record.GetLockTxId();
 
     if (record.GetOperations().size() != 1) {
         IncCounter(COUNTER_WRITE_FAIL);
